@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  claimer:
+    # Build from Dockerfile
+    build: .
+    
+    # Container name
+    container_name: auto-claim-bot
+    
+    # Restart policy: always restart unless manually stopped
+    restart: unless-stopped
+    
+    # Load environment variables from .env file
+    env_file: .env
+    
+    # Mount volumes for persistent data
+    volumes:
+      # Browser data (cookies, sessions) - survives container restarts
+      - ./data:/app/data
+      # Log files
+      - ./logs:/app/logs
+    
+    # Shared memory size (prevents Chromium crashes)
+    shm_size: "2gb"
