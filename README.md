@@ -42,11 +42,15 @@ An automated, stealth-enabled web scraping and automation bot built with Python 
 Create a .env file in the root directory and add your credentials:
 
 LOGIN_URL=your_login_url
+
 BOT_USERNAME=your_amazon_username
+
 BOT_PASSWORD=your_amazon_password
+
 TARGET_URL=your_target_url
    
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+
 TELEGRAM_CHAT_ID=your_telegram_chat_id
    
 HEADLESS=false  # Set to 'true' when deploying to a cloud VPS
