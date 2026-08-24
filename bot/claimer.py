@@ -4,14 +4,19 @@ from datetime import datetime
 from loguru import logger
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 from . import config
+import json
+from pathlib import Path
+
+CLAIMED_JOBS_FILE = Path(config.LOG_DIR) / "claimed_jobs.json"
 
 try:
-    from .notifier import notify_job_seen, notify_job_claimed as _notify_job_claimed
+    from .notifier import notify_job_seen, notify_job_claimed as _notify_job_claimed, send_telegram_message
     async def notify_job_claimed(description: str) -> None:
         await _notify_job_claimed(description)
 except ImportError:
     async def notify_job_seen() -> None: pass
     async def notify_job_claimed(description: str) -> None: pass
+    async def send_telegram_message(message: str, use_html: bool = False) -> None: pass
 
 async def notify_error(message: str) -> None:
     logger.warning(f"Notifier error: {message}")
@@ -154,46 +159,88 @@ async def login(page: Page) -> bool:
         return False
 
 
-async def extract_job_description(page: Page) -> str:
+async def extract_job_details_before_claim(page: Page) -> dict:
     try:
-        selectors = [
-            config.JOB_DESCRIPTION_SELECTOR,
-            ".job-description",
-            ".description",
-            "[data-job-description]",
-            ".job-details",
-            "#jobDescription",
-            "div.description",
-            "p.description"
-        ]
-
-        for selector in selectors:
+        weighted_words = "N/A"
+        price = "N/A"
+        claimed_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        
+        all_texts = await page.locator("*").all_text_contents()
+        
+        page_content = await page.content()
+        
+        try:
+            offer_section = page.locator(".job-offer, .offer-card, [class*='offer'], [class*='job']").first
+            
             try:
-                description_element = page.locator(selector).first
-                await description_element.wait_for(state="visible", timeout=2000)
-                description = (await description_element.text_content() or "").strip()
-
-                if description and len(description) > 10:
-                    if len(description) > 1000:
-                        description = description[:1000] + "..."
-                    logger.info(f" Extracted job description ({len(description)} chars)")
-                    return description
-            except:
-                continue
-
-        logger.warning(" Could not find job description")
-        return "Description not available"
-
+                weighted_elem = offer_section.locator("text=/Weighted Words/i, text=/weighted/i").first
+                if await weighted_elem.is_visible():
+                    weighted_text = await weighted_elem.text_content()
+                    if weighted_text:
+                        import re
+                        numbers = re.findall(r'[\d,]+\.?\d*', weighted_text)
+                        if numbers:
+                            weighted_words = numbers[0].replace(',', '')
+            except Exception:
+                pass
+            
+            try:
+                price_elem = offer_section.locator("text=/Price|Earn|Payment|\\$/i").first
+                if await price_elem.is_visible():
+                    price_text = await price_elem.text_content()
+                    import re
+                    if price_text:
+                        prices = re.findall(r'\$?[\d,]+\.?\d*', price_text)
+                        if prices:
+                            price = prices[0].replace('$', '').replace(',', '')
+            except Exception:
+                pass
+                
+        except Exception:
+            pass
+        
+        if weighted_words == "N/A" or price == "N/A":
+            try:
+                weighted_locator = page.locator("text=/\\d+\\.?\\d*\\s*weighted/i, text=/weighted\\s*words:\\s*([\\d,]+)/i").first
+                if await weighted_locator.is_visible():
+                    text = await weighted_locator.text_content()
+                    import re
+                    if text:
+                        numbers = re.findall(r'[\d,]+\.?\d*', text)
+                        if numbers:
+                            weighted_words = numbers[0].replace(',', '')
+            except Exception:
+                pass
+            
+            try:
+                price_locator = page.locator("text=/\\$\\s*([\\d,]+\\.?\\d*)/i").first
+                if await price_locator.is_visible():
+                    text = await price_locator.text_content()
+                    import re
+                    if text:
+                        prices = re.findall(r'\$?[\d,]+\.?\d*', text)
+                        if prices:
+                            price = prices[0].replace('$', '').replace(',', '')
+            except Exception:
+                pass
+        
+        return {
+            "weighted_words": weighted_words,
+            "price_usd": price,
+            "claimed_at": claimed_at
+        }
+        
     except Exception as e:
-        logger.warning(f" Error extracting job description: {e}")
-        return "Description not available"
+        logger.warning(f" Error extracting job details: {e}")
+        return {
+            "weighted_words": "N/A",
+            "price_usd": "N/A",
+            "claimed_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
 
 
 async def check_and_claim(page: Page) -> bool:
     try:
-        if not page or page.is_closed():
-            raise Exception("Page is closed")
-
         claim_button = page.locator(config.CLAIM_BUTTON_SELECTOR).first
         await claim_button.wait_for(state="visible", timeout=2000)
 
@@ -202,22 +249,26 @@ async def check_and_claim(page: Page) -> bool:
             return False
 
         logger.info(" Claim button detected!")
+        
+        logger.info(" Extracting job details before claiming...")
+        job_details = await extract_job_details_before_claim(page)
+        
         await notify_job_seen()
-
         await claim_button.click()
+        logger.info(" Claim button clicked. Verifying success...")
 
         try:
-            await page.locator(config.CLAIM_SUCCESS_SELECTOR).first.wait_for(
-                state="visible",
-                timeout=config.WAIT_AFTER_CLAIM * 1000,
-            )
+            await claim_button.wait_for(state="hidden", timeout=config.WAIT_AFTER_CLAIM * 1000)
+            logger.info(" Claim button disappeared, success confirmed!")
         except PlaywrightTimeout:
-            logger.error("Claim click occurred, but success was not confirmed")
-            await page.screenshot(path=f"{config.LOG_DIR}/claim_not_confirmed.png")
-            return False
+            if not await claim_button.is_enabled():
+                logger.info(" Claim button disabled, success confirmed!")
+            else:
+                logger.error(" Claim click occurred, but button is still enabled. Success not confirmed.")
+                await page.screenshot(path=f"{config.LOG_DIR}/claim_not_confirmed.png")
+                return False
 
-        job_description = await extract_job_description(page)
-        await notify_job_claimed(job_description)
+        await notify_job_claimed_with_details(job_details)
         return True
 
     except PlaywrightTimeout:
@@ -228,6 +279,32 @@ async def check_and_claim(page: Page) -> bool:
         logger.exception(f" Claim attempt failed: {e}")
         await notify_error(f"Claim attempt failed: {e}")
         return False
+
+
+async def notify_job_claimed_with_details(job_details: dict) -> None:
+    try:
+        price= job_details.get("price_usd", "0")
+        weighted_words = job_details.get("weighted_words", "0")
+        claimed_at = job_details.get("claimed_at", "Unknown")
+        
+        try:
+            price_float = float(price.replace(',', ''))
+            price_str = f"€{price_float:.2f}"
+        except:
+            price_str = f"€{price}" 
+        
+        message = (
+            " <b>Job Claimed Successfully!</b>\n\n"
+            f" <b>Date:</b> {claimed_at}\n"
+            f" <b>Weighted Words:</b> {weighted_words}\n"
+            f" <b>Price:</b> {price_str}\n"
+        )
+        
+        await send_telegram_message(message, use_html=True)
+        
+    except Exception as e:
+        logger.error(f" Error sending job claimed notification: {e}")
+        await send_telegram_message(" Job claimed!", use_html=True)
 
 
 async def claim_loop(page: Page):
